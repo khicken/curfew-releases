@@ -1,0 +1,201 @@
+name: Release
+
+# Builds the private khicken/curfew source and publishes the binaries here.
+# The private repo cannot run Actions, so this public repo does the build.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit of khicken/curfew to build'
+        required: true
+        default: 'main'
+      version:
+        description: 'Version without the leading v (e.g. 1.2.3 or 0.0.0-ci)'
+        required: true
+        default: '0.0.0-ci'
+      publish:
+        description: 'Create a real GitHub release on khicken/curfew-releases'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: '3.47.7'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: khicken/curfew
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze
+        continue-on-error: true
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: khicken/curfew
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - name: Compute version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else V="${{ inputs.version || '0.0.0-ci' }}"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - name: Build macOS
+        run: flutter build macos --release --build-name="$VERSION" --build-number=${{ github.run_number }} --dart-define-from-file=config/prod.json
+      - name: Ad-hoc sign and make DMG
+        run: |
+          APP=$(ls -d build/macos/Build/Products/Release/*.app | head -n 1)
+          echo "Found app: $APP"
+          codesign --force --deep -s - "$APP"
+          ./scripts/make_dmg.sh "$APP" Curfew-macOS.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Curfew-macOS
+          path: Curfew-macOS.dmg
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: khicken/curfew
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - name: Compute version
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") { $v = $env:GITHUB_REF_NAME.TrimStart('v') } else { $v = "${{ inputs.version || '0.0.0-ci' }}" }
+          "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Check installer script exists
+        run: |
+          if (-not (Test-Path installer\curfew.iss)) {
+            Write-Error "installer/curfew.iss is missing. The windows branch must provide it."
+            exit 1
+          }
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - name: Build Windows
+        run: flutter build windows --release --build-name=$env:VERSION --build-number=${{ github.run_number }} --dart-define-from-file=config/prod.json
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=$env:VERSION" installer\curfew.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path dist\Curfew-Windows-Setup.exe)) { Write-Error "dist\Curfew-Windows-Setup.exe was not produced"; exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Curfew-Windows
+          path: dist/Curfew-Windows-Setup.exe
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: khicken/curfew
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - name: Compute version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else V="${{ inputs.version || '0.0.0-ci' }}"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - name: Set up signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > android/app/upload.jks
+          {
+            echo "storeFile=${{ github.workspace }}/android/app/upload.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+      - name: Build APK
+        run: flutter build apk --release --build-name="$VERSION" --build-number=${{ github.run_number }} --dart-define-from-file=config/prod.json
+      - name: Rename APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk Curfew-Android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Curfew-Android
+          path: Curfew-Android.apk
+          if-no-files-found: error
+
+  publish:
+    needs: [macos, windows, android]
+    if: inputs.publish == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: khicken/curfew
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="${{ inputs.version || '0.0.0-ci' }}"; fi
+          BASE="https://github.com/khicken/curfew-releases/releases/download/v${VERSION}"
+          cd artifacts
+          jq -n \
+            --arg version "$VERSION" \
+            --arg published_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg macos "$BASE/Curfew-macOS.dmg" \
+            --arg windows "$BASE/Curfew-Windows-Setup.exe" \
+            --arg android "$BASE/Curfew-Android.apk" \
+            '{version:$version, published_at:$published_at, assets:{macos:$macos, windows:$windows, android:$android}}' > latest.json
+          cat latest.json
+          PRE=""
+          case "$VERSION" in *-*) PRE="--prerelease";; esac
+          # releases/latest/download ignores prereleases.
+          gh release create "v${VERSION}" --repo khicken/curfew-releases \
+            --title "Curfew ${VERSION}" --notes-file "$GITHUB_WORKSPACE/RELEASE_NOTES.md" $PRE \
+            Curfew-macOS.dmg Curfew-Windows-Setup.exe Curfew-Android.apk latest.json
